@@ -820,6 +820,11 @@
             </div>
             <div class="flex flex-wrap items-center gap-2">
               <select id="filter-kelas-analisis" onchange="renderAnalisisButirSoal(); renderAnalisisPerNomor();" class="px-3 py-2 rounded-xl border border-slate-300 bg-white text-xs font-bold"></select>
+              <select id="filter-duplikat-analisis" onchange="renderAnalisisButirSoal(); renderAnalisisPerNomor();" class="px-3 py-2 rounded-xl border border-slate-300 bg-white text-xs font-bold" title="Aturan jika ada siswa dengan data LKS ganda">
+                <option value="latest" selected>Data Ganda: LKS Terbaru</option>
+                <option value="first">Data Ganda: LKS Pertama</option>
+                <option value="highest">Data Ganda: Nilai Tertinggi</option>
+              </select>
               <button type="button" id="btn-export-analisis" onclick="exportAnalisisButirSoalExcel(this)" class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-emerald-950 text-xs font-extrabold">
                 📥 Unduh Analisis (Excel)
               </button>
@@ -1223,6 +1228,29 @@ function doPost(e) {
       return buildOutput({ status: 'success', unblockedAtMs: nowMs });
     }
     if (action === 'update_uraian') {
+if (action === 'delete_lks') {
+      if (!TEACHER_PINS.includes(String(data.pin||'').trim())) return buildOutput({ status: 'unauthorized' });
+      const sheet = getLksSheet(), lastRow = sheet.getLastRow();
+      let deleted = 0;
+      if (lastRow > 1 && data.idBukti) {
+        const ids = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
+        for (let i = ids.length - 1; i >= 0; i--) {
+          if (String(ids[i][0]).trim() === String(data.idBukti).trim()) {
+            sheet.deleteRow(i + 2);
+            deleted++;
+          }
+        }
+      }
+      const sKey = makeStudentKey(data.kelas, data.nama);
+      const lSheet = getLiveSheet(), lLast = lSheet.getLastRow();
+      if (lLast > 1 && data.nama) {
+        const lKeys = lSheet.getRange(2, 2, lLast - 1, 1).getValues();
+        for (let i = lKeys.length - 1; i >= 0; i--) {
+          if (String(lKeys[i][0]) === sKey) lSheet.deleteRow(i + 2);
+        }
+      }
+      return buildOutput({ status: 'success', deleted: deleted });
+    }
       if (!TEACHER_PINS.includes(String(data.pin||'').trim())) return buildOutput({ status: 'unauthorized' });
       const sheet = getLksSheet(), lastRow = sheet.getLastRow(), rec = data.record || {};
       if (lastRow &gt; 1 &amp;&amp; rec.idBukti) {
@@ -4243,15 +4271,68 @@ function doGet(e) {
       }
     }
 
+// DASBOR ANALISIS BUTIR SOAL & EKSPOR EXCEL
     // =========================================================================
-    // DASBOR ANALISIS BUTIR SOAL & EKSPOR EXCEL
-    // =========================================================================
+    function getAnalisisDuplicateMode() {
+      const el = document.getElementById('filter-duplikat-analisis');
+      return el ? el.value : 'latest';
+    }
+
+    function getRecordTimestampMs(rec, index, total) {
+      if (Number.isFinite(Number(rec.submittedAtMs))) return Number(rec.submittedAtMs);
+      if (rec.idBukti && String(rec.idBukti).startsWith('SAS-')) {
+        const parsedBase36 = parseInt(String(rec.idBukti).slice(4), 36);
+        if (!Number.isNaN(parsedBase36) && parsedBase36 > 1000000000000) return parsedBase36;
+      }
+      const raw = rec.submittedAt || rec.timestamp || rec.createdAt || rec.waktuSelesai;
+      if (raw) {
+        const parsed = Date.parse(raw);
+        if (!Number.isNaN(parsed)) return parsed;
+      }
+      return total - index;
+    }
+
+    function deduplicateAnalisisRecords(records, mode = getAnalisisDuplicateMode()) {
+      if (!Array.isArray(records) || records.length === 0) return [];
+      const map = new Map();
+      const total = records.length;
+
+      records.forEach((rec, idx) => {
+        const key = makeStudentKey(rec.kelas, rec.nama);
+        const timeMs = getRecordTimestampMs(rec, idx, total);
+        const score = computeResultMetrics(rec).nilaiAkhir;
+
+        if (!map.has(key)) {
+          map.set(key, { rec, timeMs, score });
+          return;
+        }
+
+        const current = map.get(key);
+        let replace = false;
+
+        if (mode === 'latest') {
+          replace = timeMs > current.timeMs;
+        } else if (mode === 'first') {
+          replace = timeMs < current.timeMs;
+        } else if (mode === 'highest') {
+          replace = score > current.score || (score === current.score && timeMs > current.timeMs);
+        }
+
+        if (replace) {
+          map.set(key, { rec, timeMs, score });
+        }
+      });
+
+      return Array.from(map.values()).map(item => item.rec);
+    }
+
     function computeItemAnalysis(filterKelas = 'ALL') {
       const allResults = JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.RESULTS) || '[]');
-      const filtered = allResults.filter(r =>
+      const filteredByClass = allResults.filter(r =>
         (filterKelas === 'ALL' || r.kelas === filterKelas) &&
         r.itemResponses && typeof r.itemResponses === 'object'
       );
+      const filtered = deduplicateAnalisisRecords(filteredByClass);
 
       const n = filtered.length;
 
@@ -5204,14 +5285,59 @@ function doGet(e) {
             <td class="p-3 text-center">
               <div class="flex items-center justify-center gap-1.5">
                 <button type="button" onclick="openLksSiswaModal(${originalIdx})" class="px-2.5 py-1.5 rounded-lg bg-emerald-800 hover:bg-emerald-900 text-white text-[11px] font-bold">👁️ Lihat LKS</button>
-                <button type="button" onclick="exportSingleLksSiswaExcel(${originalIdx})" class="px-2.5 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 text-[11px] font-bold">📥 Excel</button>
+                <button type="button" onclick="exportSingleLksSiswaExcel(${originalIdx})" class="px-2.5 py-1.5 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 text-[11px] font-bold">
+📥 Excel</button>
+<button type="button" onclick="deleteStudentLks(${originalIdx}, this)" class="px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-bold">🗑️ Hapus</button>
               </div>
             </td>
           </tr>`;
       }).join('');
     }
 
-    function openLksSiswaModal(resultIdx) {
+async function deleteStudentLks(resultIdx, btnEl) {
+      if (!isTeacherAuthorized) return;
+      const results = JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.RESULTS) || '[]');
+      const r = results[resultIdx];
+      if (!r) return;
+
+      if (!confirm(`Hapus LKS milik "${r.nama}" (${r.kelas}) dengan ID ${r.idBukti}?\n\nLKS ini akan dihapus permanen dari Panel Guru dan Google Sheets agar siswa dapat mengulang ujian dengan bersih.`)) {
+        return;
+      }
+
+      if (btnEl) {
+        btnEl.disabled = true;
+        btnEl.textContent = '⏳...';
+      }
+
+      const updatedResults = results.filter((_, idx) => idx !== resultIdx);
+      localStorage.setItem(CONFIG.STORAGE_KEYS.RESULTS, JSON.stringify(updatedResults));
+      if (r.idBukti) removePendingLks(r.idBukti);
+
+      const sKey = makeStudentKey(r.kelas, r.nama);
+      const localLive = JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.LIVE_LOCAL) || '{}');
+      if (localLive[sKey]) {
+        delete localLive[sKey];
+        localStorage.setItem(CONFIG.STORAGE_KEYS.LIVE_LOCAL, JSON.stringify(localLive));
+      }
+      cloudLiveSessions = cloudLiveSessions.filter(s => makeStudentKey(s.kelas, s.nama) !== sKey);
+
+      await postToCloud({
+        action: 'delete_lks',
+        pin: activeTeacherPin,
+        idBukti: r.idBukti,
+        kelas: r.kelas,
+        nama: r.nama
+      });
+
+      updateSidebarBadges();
+      renderDasborLksSiswa();
+      renderRekapPerKelas();
+      renderAnalisisButirSoal();
+      renderAnalisisPerNomor();
+      renderBerandaLive();
+      alert(`✅ LKS milik "${r.nama}" berhasil dihapus.`);
+    }    
+function openLksSiswaModal(resultIdx) {
       if (!isTeacherAuthorized) return;
       const results = JSON.parse(localStorage.getItem(CONFIG.STORAGE_KEYS.RESULTS) || '[]');
       const r = results[resultIdx];
